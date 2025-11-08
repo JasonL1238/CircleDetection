@@ -180,10 +180,37 @@ def fit_ellipse_to_partial_contour(contour, min_points=5):
         if a < 5 or b < 5:  # Too small
             return None
         
-        # Check aspect ratio (should be roughly circular)
+        # Check aspect ratio (should be roughly circular - stricter for hoops)
         ratio = max(a, b) / (min(a, b) + 1e-6)
-        if ratio > 2.5:  # Too elliptical
+        if ratio > 1.3:  # Even stricter: hoops should be very nearly circular (was 1.5)
             return None
+        
+        # Check angle - hoops should be roughly horizontal/vertical, not diagonal
+        # Normalize angle to 0-90 range
+        normalized_angle = angle % 90
+        if normalized_angle > 45:
+            normalized_angle = 90 - normalized_angle
+        
+        # Reject ellipses that are too diagonal (angle close to 45°)
+        # Allow angles close to 0° or 90° (horizontal/vertical hoops)
+        # But if aspect ratio is high AND angle is diagonal, definitely reject
+        if ratio > 1.2 and 25 < normalized_angle < 65:  # Stricter: reject if both conditions
+            return None
+        elif 35 < normalized_angle < 55:  # Reject clearly diagonal ellipses regardless of ratio
+            return None
+        
+        # Check circularity - how well the contour matches a perfect circle
+        # Calculate area and perimeter
+        area = cv2.contourArea(contour)
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter > 0:
+            circularity = 4 * math.pi * area / (perimeter * perimeter)
+            # Circularity should be close to 1.0 for a perfect circle
+            # Accept circularity > 0.5 for partial circles
+            # But if aspect ratio is high, require better circularity
+            min_circularity = 0.5 if ratio < 1.15 else 0.6
+            if circularity < min_circularity:  # Too non-circular
+                return None
         
         return {
             'center': (int(center[0]), int(center[1])),
@@ -215,7 +242,7 @@ def hough_circles_fallback(img, mask=None, dp=1, minDist=30, param1=50, param2=3
         param1: Upper threshold for edge detection
         param2: Accumulator threshold for center detection
         minRadius: Minimum circle radius
-        maxRadius: Maximum circle radius
+        maxRadius: Maximum circle radius (will be made adaptive if None)
         use_inner_edges: Whether to focus on inner edges only
         use_partial_circles: Whether to use contour fitting for partial circles
     
@@ -228,67 +255,145 @@ def hough_circles_fallback(img, mask=None, dp=1, minDist=30, param1=50, param2=3
     else:
         gray = img
     
+    h, w = gray.shape
+    
+    # Make maxRadius adaptive based on image size for close hoops
+    # Allow hoops up to 50% of the smaller image dimension (increased from 40%)
+    if maxRadius is None or maxRadius < min(w, h) * 0.2:
+        maxRadius = max(maxRadius if maxRadius else 100, int(min(w, h) * 0.5))
+    
     detected_ellipses = []
     
     if use_partial_circles:
         # Method 1: Contour-based ellipse fitting (works for partial circles)
-        if use_inner_edges:
-            # Extract only inner edges
-            edges = extract_inner_edges(gray, mask, canny_low=param1, canny_high=param2)
-        else:
-            # Use all edges
-            blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-            if mask is not None:
-                blurred = cv2.bitwise_and(blurred, blurred, mask=mask)
-            edges = cv2.Canny(blurred, param1, param2)
+        # Try multiple edge detection strategies for better detection
+        edge_images = []
+        masks_to_try = [mask] if mask is not None else [None]
         
-        # Find contours
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # If we have a mask and no detections, also try without mask for close hoops
+        if mask is not None:
+            masks_to_try.append(None)
         
-        for contour in contours:
-            if len(contour) >= 5:  # Minimum points for ellipse fitting
-                # Fit ellipse to contour
-                ellipse = fit_ellipse_to_partial_contour(contour)
-                if ellipse is not None:
-                    # Additional validation: check if it's roughly circular
-                    a, b = ellipse['a'], ellipse['b']
-                    ratio = max(a, b) / (min(a, b) + 1e-6)
-                    if ratio < 2.0:  # Acceptable aspect ratio
-                        # Check size constraints
-                        if minRadius <= min(a, b) <= maxRadius:
-                            detected_ellipses.append(ellipse)
+        for current_mask in masks_to_try:
+            if use_inner_edges:
+                # Extract only inner edges
+                edges = extract_inner_edges(gray, current_mask, canny_low=param1, canny_high=param2)
+                edge_images.append((edges, current_mask))
+                
+                # Also try with adjusted thresholds for close hoops (larger hoops need different thresholds)
+                edges_adj = extract_inner_edges(gray, current_mask, canny_low=max(30, param1-20), canny_high=min(200, param2+50))
+                edge_images.append((edges_adj, current_mask))
+            else:
+                # Use all edges
+                blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+                if current_mask is not None:
+                    blurred = cv2.bitwise_and(blurred, blurred, mask=current_mask)
+                edges = cv2.Canny(blurred, param1, param2)
+                edge_images.append((edges, current_mask))
+                
+                # Also try with adjusted thresholds
+                edges_adj = cv2.Canny(blurred, max(30, param1-20), min(200, param2+50))
+                edge_images.append((edges_adj, current_mask))
+            
+            # Also try without inner edges for close hoops (all edges)
+            if use_inner_edges:
+                blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+                if current_mask is not None:
+                    blurred = cv2.bitwise_and(blurred, blurred, mask=current_mask)
+                edges_all = cv2.Canny(blurred, param1, param2)
+                edge_images.append((edges_all, current_mask))
+                edges_all_adj = cv2.Canny(blurred, max(30, param1-20), min(200, param2+50))
+                edge_images.append((edges_all_adj, current_mask))
+        
+        # Try all edge images
+        for edges, edge_mask in edge_images:
+            # Find contours
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                if len(contour) >= 5:  # Minimum points for ellipse fitting
+                    # Fit ellipse to contour
+                    ellipse = fit_ellipse_to_partial_contour(contour)
+                    if ellipse is not None:
+                        # Additional validation: check if it's roughly circular
+                        a, b = ellipse['a'], ellipse['b']
+                        ratio = max(a, b) / (min(a, b) + 1e-6)
+                        if ratio < 1.3:  # Stricter: acceptable aspect ratio (was 1.5)
+                            # Check size constraints - use average radius for close hoops
+                            avg_radius = (a + b) / 2
+                            min_radius = min(a, b)
+                            max_radius = max(a, b)
+                            # More flexible: accept if any radius measure is in range, or if it's a large close hoop
+                            if ((minRadius <= avg_radius <= maxRadius) or 
+                                (minRadius <= min_radius <= maxRadius) or
+                                (minRadius <= max_radius <= maxRadius) or
+                                (avg_radius > maxRadius * 0.7 and avg_radius <= maxRadius * 1.5)):  # Allow slightly larger for close hoops
+                                detected_ellipses.append(ellipse)
+        
+        # Remove duplicates (ellipses that are very close to each other)
+        if len(detected_ellipses) > 1:
+            unique_ellipses = []
+            for ellipse in detected_ellipses:
+                is_duplicate = False
+                for existing in unique_ellipses:
+                    # Check if centers are very close
+                    dist = math.sqrt((ellipse['xc'] - existing['xc'])**2 + (ellipse['yc'] - existing['yc'])**2)
+                    if dist < minDist:
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    unique_ellipses.append(ellipse)
+            detected_ellipses = unique_ellipses
         
         # If no ellipses found with partial method, try HoughCircles as backup
+        # Try with and without mask for close hoops
         if len(detected_ellipses) == 0:
-            blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+            masks_for_hough = [mask] if mask is not None else [None]
             if mask is not None:
-                blurred = cv2.bitwise_and(blurred, blurred, mask=mask)
+                masks_for_hough.append(None)  # Also try without mask
             
-            circles = cv2.HoughCircles(
-                blurred,
-                cv2.HOUGH_GRADIENT,
-                dp=dp,
-                minDist=minDist,
-                param1=param1,
-                param2=param2,
-                minRadius=minRadius,
-                maxRadius=maxRadius
-            )
-            
-            if circles is not None:
-                circles = np.round(circles[0, :]).astype("int")
-                for (x, y, r) in circles:
-                    detected_ellipses.append({
-                        'center': (int(x), int(y)),
-                        'axes': (int(r * 2), int(r * 2)),
-                        'angle': 0.0,
-                        'xc': float(x),
-                        'yc': float(y),
-                        'a': float(r),
-                        'b': float(r),
-                        'orientation': 0.0,
-                        'confidence': 1.0
-                    })
+            for hough_mask in masks_for_hough:
+                blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+                if hough_mask is not None:
+                    blurred = cv2.bitwise_and(blurred, blurred, mask=hough_mask)
+                
+                # Try multiple parameter sets for different hoop sizes
+                param_sets = [
+                    (param1, param2),  # Original
+                    (max(30, param1-20), min(200, param2+50)),  # Adjusted for larger hoops
+                    (max(20, param1-30), min(250, param2+100)),  # More adjusted for very large hoops
+                ]
+                
+                for p1, p2 in param_sets:
+                    circles = cv2.HoughCircles(
+                        blurred,
+                        cv2.HOUGH_GRADIENT,
+                        dp=dp,
+                        minDist=minDist,
+                        param1=p1,
+                        param2=p2,
+                        minRadius=minRadius,
+                        maxRadius=maxRadius
+                    )
+                    
+                    if circles is not None:
+                        circles = np.round(circles[0, :]).astype("int")
+                        for (x, y, r) in circles:
+                            detected_ellipses.append({
+                                'center': (int(x), int(y)),
+                                'axes': (int(r * 2), int(r * 2)),
+                                'angle': 0.0,
+                                'xc': float(x),
+                                'yc': float(y),
+                                'a': float(r),
+                                'b': float(r),
+                                'orientation': 0.0,
+                                'confidence': 1.0
+                            })
+                        break  # Found circles, no need to try other param sets
+                
+                if len(detected_ellipses) > 0:
+                    break  # Found ellipses, no need to try other masks
     else:
         # Original HoughCircles method
         blurred = cv2.GaussianBlur(gray, (9, 9), 2)
@@ -378,7 +483,7 @@ def detect_hoops_ellipse_yolo(img,
                                fallback_param1=50,
                                fallback_param2=30,
                                fallback_minRadius=10,
-                               fallback_maxRadius=100,
+                               fallback_maxRadius=None,  # None = adaptive based on image size
                                use_inner_edges=True,  # Focus on inner edges only
                                use_partial_circles=True,  # Support partial circles
                                # Selection parameters
@@ -528,7 +633,7 @@ def detect_hoops_ellipse_yolo(img,
     return result_img, detected_ellipses, nearest_idx, edge_image, mask
 
 
-def process_video(video_path, output_dir, canny_edges_dir, **kwargs):
+def process_video(video_path, output_dir, canny_edges_dir, output_video_path=None, **kwargs):
     """
     Process video file with Ellipse-YOLO pipeline
     
@@ -536,6 +641,7 @@ def process_video(video_path, output_dir, canny_edges_dir, **kwargs):
         video_path: Path to input video file
         output_dir: Directory to save result images
         canny_edges_dir: Directory to save Canny edge images
+        output_video_path: Path to save output video (optional)
         **kwargs: Additional parameters for detect_hoops_ellipse_yolo
     """
     video_path = Path(video_path)
@@ -552,7 +658,25 @@ def process_video(video_path, output_dir, canny_edges_dir, **kwargs):
         return
     
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"  Video has {total_frames} frames")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30  # Default to 30 fps if not available
+    print(f"  Video has {total_frames} frames at {fps:.2f} fps")
+    
+    # Set up video writer if output path is provided
+    video_writer = None
+    if output_video_path:
+        # Get frame dimensions from first frame
+        ret, first_frame = cap.read()
+        if ret:
+            h, w = first_frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(str(output_video_path), fourcc, fps, (w, h))
+            if not video_writer.isOpened():
+                print(f"Warning: Could not create video file {output_video_path}")
+                video_writer = None
+            else:
+                print(f"  Creating output video: {output_video_path}")
+            # Reset video to beginning
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     
     processed = 0
     frame_num = 0
@@ -575,6 +699,10 @@ def process_video(video_path, output_dir, canny_edges_dir, **kwargs):
         canny_file = canny_path / f"frame_{frame_num:06d}_edges.jpg"
         cv2.imwrite(str(canny_file), edge_img)
         
+        # Write to video if writer is available
+        if video_writer is not None:
+            video_writer.write(result_img)
+        
         processed += 1
         frame_num += 1
         
@@ -584,6 +712,10 @@ def process_video(video_path, output_dir, canny_edges_dir, **kwargs):
                 print(f"    Detected {len(ellipses)} ellipse(s), nearest: {nearest_idx}")
     
     cap.release()
+    if video_writer is not None:
+        video_writer.release()
+        print(f"\n✓ Video saved to: {output_video_path}")
+    
     print(f"\n✓ Processed {processed} frames")
     print(f"  Results saved to: {output_path}")
     print(f"  Canny edges saved to: {canny_path}")
