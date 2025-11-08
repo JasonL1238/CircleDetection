@@ -1,18 +1,24 @@
 # Circle Detection from Different Angles
 
-A computer vision project for detecting circles in images captured from various viewing angles.
+A computer vision project for detecting circles/hoops in images captured from various viewing angles.
 
 ## Project Structure
 
 ```
 circle_detection/
-├── src/              # Source code
-│   └── detect_circles.py
-├── input/            # Place input images here
-├── output/           # Processed images with detected circles
-├── images/           # Additional image resources
-├── results/          # Analysis results and data
-├── requirements.txt  # Python dependencies
+├── input/                    # Input data
+│   ├── front_frames/         # Individual frame images
+│   └── front.mp4            # Video file
+├── pipelines/                # Detection pipelines
+│   ├── canny_edges/         # Simple Canny edge detection
+│   │   ├── src/
+│   │   ├── output/
+│   │   └── README.md
+│   └── ransac_knn/          # RANSAC + k-NN hoop detection
+│       ├── src/
+│       ├── output/
+│       └── README.md
+├── requirements.txt          # Python dependencies
 └── README.md
 ```
 
@@ -23,21 +29,53 @@ circle_detection/
 pip install -r requirements.txt
 ```
 
-2. Place your images in the `input/` folder
+2. Place your input data in the `input/` folder:
+   - Video files: `input/front.mp4`
+   - Frame images: `input/front_frames/frame_XXXXXX.jpg`
 
-3. Run the detection script:
+## Available Pipelines
+
+### 1. Canny Edge Detection (`pipelines/canny_edges/`)
+
+Simple edge detection pipeline that extracts Canny edges from video frames.
+
+**Usage:**
 ```bash
-python src/detect_circles.py
+cd pipelines/canny_edges
+python src/detect_canny_edges.py
 ```
 
-## Usage
+See [pipelines/canny_edges/README.md](pipelines/canny_edges/README.md) for details.
 
-The main detection function is in `src/detect_circles.py`. You can import and use it:
+### 2. RANSAC + k-NN Hoop Detection (`pipelines/ransac_knn/`)
 
-```python
-from src.detect_circles import detect_circles
+Advanced pipeline for detecting red hoops using:
+- HSV color masking
+- Edge detection
+- DBSCAN clustering
+- RANSAC ellipse fitting
+- k-NN selection
 
-circles, output_img = detect_circles('input/your_image.jpg', 'output/result.jpg')
-print(f"Detected {len(circles)} circles")
+**Usage:**
+```bash
+cd pipelines/ransac_knn
+python src/detect_hoops_ransac_knn.py
 ```
 
+See [pipelines/ransac_knn/README.md](pipelines/ransac_knn/README.md) for details.
+
+## Output Structure
+
+Each pipeline has its own output directory:
+- `pipelines/canny_edges/output/canny_edges/` - Edge images
+- `pipelines/ransac_knn/output/canny_edges/` - Edge images
+- `pipelines/ransac_knn/output/results/` - Detection results with ellipses
+
+## Dependencies
+
+- `opencv-python>=4.8.0`
+- `numpy>=1.24.0`
+- `matplotlib>=3.7.0`
+- `scipy>=1.10.0`
+- `scikit-image>=0.21.0`
+- `scikit-learn>=1.3.0` (for RANSAC + k-NN pipeline)
